@@ -616,19 +616,26 @@ success:
 	f->mem = mem_ref(mem);
 	f->playout_time = calc_playout_time(jb, f);
 
-	/* Calculate clock skew */
+	/* Calculate clock skew.
+	 *
+	 * Kallo SDK fix (0.1.4): the upstream negative-skew branch DROPPED the
+	 * just-arrived, in-order packet (packet_deref + err = ETIME) the first
+	 * time the receiver clock was measured slower than the sender — which is
+	 * re-evaluated once per JBUF_DRIFT_WINDOW (10s). On a phone whose audio
+	 * (AAudio) clock is not synchronised to the PBX's RTP sender clock this
+	 * fires ~10s into every call and abandons the steady inbound stream
+	 * (rtprecv: "dropping N bytes ... Timer expired [62]"), silencing
+	 * downlink audio while the call stays up. Dropping a good, in-order
+	 * telephony packet to compensate clock drift is wrong here: latency
+	 * creep is already bounded by the jbuf maxsz overflow handling (oldest
+	 * frame is stolen) and absorbed by the audio receiver's aubuf, so we
+	 * keep the packet in BOTH skew directions and only re-anchor the playout
+	 * offset. This removes the ETIME drop without unbounded latency growth. */
 	int32_t skew_adjust = adjust_due_to_skew(jb, f);
-	if (skew_adjust > 0) {
-		/* This delays next playout, it's likely that aubuf
-		 * underruns, maybe a dummy packet can be added in the
-		 * future. */
+	if (skew_adjust != 0) {
+		/* Re-anchor playout offset; keep the packet buffered so a
+		 * continuous inbound stream is never dropped. */
 		jb->p.offset = 0;
-		goto out;
-	}
-	else if (skew_adjust < 0) {
-		jb->p.offset = 0;
-		packet_deref(jb, f);
-		err = ETIME;
 		goto out;
 	}
 
