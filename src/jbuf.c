@@ -616,28 +616,38 @@ success:
 	f->mem = mem_ref(mem);
 	f->playout_time = calc_playout_time(jb, f);
 
-	/* Calculate clock skew.
+	/* Clock-skew handling (Kallo SDK fork — minimal patch).
 	 *
-	 * Kallo SDK fix (0.1.4): the upstream negative-skew branch DROPPED the
-	 * just-arrived, in-order packet (packet_deref + err = ETIME) the first
-	 * time the receiver clock was measured slower than the sender — which is
-	 * re-evaluated once per JBUF_DRIFT_WINDOW (10s). On a phone whose audio
-	 * (AAudio) clock is not synchronised to the PBX's RTP sender clock this
-	 * fires ~10s into every call and abandons the steady inbound stream
-	 * (rtprecv: "dropping N bytes ... Timer expired [62]"), silencing
-	 * downlink audio while the call stays up. Dropping a good, in-order
-	 * telephony packet to compensate clock drift is wrong here: latency
-	 * creep is already bounded by the jbuf maxsz overflow handling (oldest
-	 * frame is stolen) and absorbed by the audio receiver's aubuf, so we
-	 * keep the packet in BOTH skew directions and only re-anchor the playout
-	 * offset. This removes the ETIME drop without unbounded latency growth. */
-	int32_t skew_adjust = adjust_due_to_skew(jb, f);
-	if (skew_adjust != 0) {
-		/* Re-anchor playout offset; keep the packet buffered so a
-		 * continuous inbound stream is never dropped. */
-		jb->p.offset = 0;
-		goto out;
-	}
+	 * Upstream's skew compensation in jbuf_put() does two destructive things
+	 * once the measured sender/receiver drift exceeds JBUF_MAX_DRIFT (20ms),
+	 * re-evaluated once per JBUF_DRIFT_WINDOW (10s):
+	 *   1. negative skew (receiver clock slower): it DROPPED the just-arrived,
+	 *      in-order packet (packet_deref + err = ETIME). On a phone whose audio
+	 *      (AAudio) clock is not synced to the PBX RTP clock this fires ~10s
+	 *      into a call and abandons the steady inbound stream — the 0.1.3
+	 *      "rtprecv: dropping N bytes ... Timer expired [62]" / ~10s drop.
+	 *   2. BOTH skew directions then re-anchored the playout offset
+	 *      (jb->p.offset = 0). Resetting the offset makes calc_playout_time()
+	 *      recompute jb->p.offset from the *current* packet on the next put,
+	 *      which jumps play_time_base by the drift accumulated so far. Every
+	 *      subsequent packet is then scheduled later than wall-clock playout
+	 *      (next_play), so jbuf_get() returns ENOENT, the decode timer starves,
+	 *      the receiver aubuf underruns and is zero-filled → an *unlogged*
+	 *      silent downlink gap. The first patch (0.1.4) removed the ETIME drop
+	 *      but KEPT the offset re-anchor in both directions, which is exactly
+	 *      what produced the 0.1.4 regression: intermittent/silent downlink
+	 *      that cuts at the ~10s skew windows with healthy-looking logs.
+	 *
+	 * For a continuous telephony stream the right behaviour is to do NEITHER:
+	 * keep the in-order packet and leave jb->p.offset alone. Drift is already
+	 * bounded by the jbuf maxsz overflow (oldest frame stolen) and absorbed by
+	 * the receiver aubuf, and the offset-min anchor in calc_playout_time()
+	 * continuously tracks the lowest-latency timeline without discontinuities.
+	 * adjust_due_to_skew() is still called for its skew statistic / running
+	 * estimate side-effects (visible in jbuf_debug / jbuf_stats); its return
+	 * value is intentionally unused. This is a smaller diff from upstream than
+	 * the 0.1.4 patch and removes both the ETIME drop AND the silent gap. */
+	(void)adjust_due_to_skew(jb, f);
 
 	/* Late Playout check: */
 	uint32_t next = (uint32_t)jb->next_play_h(jb);

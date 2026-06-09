@@ -18,7 +18,28 @@ struct auplay_st {
 	void *arg;
 	struct auplay_prm play_prm;
 	size_t sampsz;
+
+	/* Kallo SDK playout instrumentation. Measures what actually reaches the
+	 * AAudio device at the pull point (dataCallback), so a silent downlink is
+	 * visible directly instead of being inferred from RTP-receive counts.
+	 * Logged once per ~1s: frames pulled, peak |sample| and the fraction of
+	 * non-silent samples over the interval. A continuous call shows frames>0
+	 * and a high active% every interval; a silent gap (aubuf underrun /
+	 * jitter-buffer playout stall) drops active% and peak to ~0 for that
+	 * interval even though dataCallback keeps being invoked. */
+	uint64_t dbg_frames;     /**< frames pulled this interval        */
+	uint64_t dbg_active;     /**< non-silent samples this interval   */
+	int32_t  dbg_peak;       /**< peak |sample| this interval        */
+	uint64_t dbg_total_fr;   /**< frames pulled since stream start   */
+	uint64_t dbg_silent_iv;  /**< count of fully-silent intervals    */
+	uint32_t dbg_iv;         /**< interval index (≈ seconds)         */
+	uint64_t dbg_win;        /**< frames remaining in current window */
 };
+
+/* Sample magnitude below this (out of 32767) is treated as silence. PCMU
+ * idle/comfort noise and zero-fill underruns sit well under this; speech /
+ * a test tone sits far above it. */
+#define KALLO_SILENCE_THRESH 64
 
 
 static int open_player_stream(struct auplay_st *st);
@@ -50,6 +71,49 @@ static void auplay_destructor(void *arg)
 		     st->play_prm.srate, st->play_prm.ch);
 
 	st->wh(&af, st->arg);
+
+	/* ── Kallo SDK playout instrumentation ──────────────────────────────
+	 * Inspect the PCM the write handler just produced for the device. fmt is
+	 * AUFMT_S16LE (enforced at alloc), ch==1. */
+	const int16_t *s = (const int16_t *)audioData;
+	for (int32_t i = 0; i < numFrames; i++) {
+		int32_t v = s[i];
+		if (v < 0)
+			v = -v;
+		if (v > st->dbg_peak)
+			st->dbg_peak = v;
+		if (v > KALLO_SILENCE_THRESH)
+			++st->dbg_active;
+	}
+	st->dbg_frames   += (uint64_t)numFrames;
+	st->dbg_total_fr += (uint64_t)numFrames;
+
+	if (st->dbg_win <= (uint64_t)numFrames) {
+		uint64_t fr  = st->dbg_frames ? st->dbg_frames : 1;
+		unsigned act = (unsigned)((st->dbg_active * 100) / fr);
+		bool silent  = (st->dbg_peak <= KALLO_SILENCE_THRESH);
+		if (silent)
+			++st->dbg_silent_iv;
+
+		/* One greppable line per second. "SILENT" marks a gap. */
+		info("aaudio: PLAYOUT t=%us frames=%llu peak=%d active=%u%% "
+		     "total=%llu silent_ivs=%llu%s\n",
+		     st->dbg_iv,
+		     (unsigned long long)st->dbg_frames,
+		     (int)st->dbg_peak, act,
+		     (unsigned long long)st->dbg_total_fr,
+		     (unsigned long long)st->dbg_silent_iv,
+		     silent ? "  <<SILENT>>" : "");
+
+		st->dbg_iv     += 1;
+		st->dbg_frames  = 0;
+		st->dbg_active  = 0;
+		st->dbg_peak    = 0;
+		st->dbg_win     = st->play_prm.srate; /* ~1s of frames */
+	}
+	else {
+		st->dbg_win -= (uint64_t)numFrames;
+	}
 
 	return 0;
 }
