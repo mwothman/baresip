@@ -66,7 +66,31 @@ struct rtp_receiver {
 	uint64_t rxc_bytes_iv;         /**< bytes this log interval           */
 	uint64_t rxc_next_log;         /**< jiffies of next periodic log      */
 	bool      rxc_first;           /**< first inbound packet logged       */
+
+	/* Kallo SDK decode-side instrumentation (Bug B). The rxc_* counters above
+	 * prove RTP reaches the socket layer; these prove what happens between the
+	 * jitter buffer and the decoder, which is where a mid-call playout stall
+	 * lives (rxc climbing but aaudio PLAYOUT peak=0). Counts per ~1s interval:
+	 * jbuf_get outcomes (ok = a frame pulled and decoded, eagain = jbuf has the
+	 * frame but it is not due for playout yet, enoent = jbuf empty), frames
+	 * actually handed to the decoder, and the live jbuf depth + next-play delay.
+	 * A healthy call shows dec_ok climbing every interval; a stall shows dec_ok
+	 * stop while dec_eagain/dec_enoent dominate and jbuf depth grows or pins —
+	 * pinpointing a jitter-buffer playout-scheduling stall rather than a dead
+	 * decode timer (the timer self-reschedules). */
+	uint64_t dec_ok;               /**< jbuf_get OK (frame decoded) /iv    */
+	uint64_t dec_eagain;           /**< jbuf_get EAGAIN (not due) /iv      */
+	uint64_t dec_enoent;           /**< jbuf_get ENOENT (empty) /iv        */
+	uint64_t dec_ok_tot;           /**< jbuf_get OK since RX start         */
+	uint64_t dec_next_log;         /**< jiffies of next decode log         */
+	uint32_t dec_stall_ivs;        /**< consecutive stalled log intervals  */
 };
+
+/* Consecutive 1s intervals of "packets buffered but none released for playout"
+ * that trigger the Bug B self-recovery flush. Two seconds is well beyond any
+ * legitimate jitter cushion (max playout delay is 240 ms) yet short enough that
+ * a real stall recovers quickly instead of staying silent for the whole call. */
+#define DEC_STALL_RECOVER_IVS 2
 
 /* RX-counter log cadence [ms]. One greppable "rtprecv: RX" line per interval. */
 #define RXC_LOG_MS 1000
@@ -387,6 +411,14 @@ static void decode_frames(struct rtp_receiver *rx)
 
 	do {
 		err = jbuf_get(rx->jbuf, &hdr, &mb);
+		if (err == EAGAIN)
+			++rx->dec_eagain;
+		else if (err == ENOENT)
+			++rx->dec_enoent;
+		else if (!err) {
+			++rx->dec_ok;
+			++rx->dec_ok_tot;
+		}
 		if (err && err != EAGAIN)
 			break;
 
@@ -403,6 +435,60 @@ static void decode_frames(struct rtp_receiver *rx)
 	delay = jbuf_next_play(rx->jbuf);
 	if (delay < 0)
 		delay = 10; /* Fallback time */
+
+	/* ── Kallo SDK decode-side telemetry (Bug B) ────────────────────────────
+	 * One greppable "rtprecv: DECODE" line per ~1s. dec_ok=0 over an interval
+	 * while RTP is still arriving (rxc climbing) localises a mid-call playout
+	 * stall to the jitter buffer (frames present but never released for
+	 * playout), as opposed to a stalled/dead decode timer. */
+	if (rx->jbuf) {
+		const uint64_t now = tmr_jiffies();
+		if (!rx->dec_next_log)
+			rx->dec_next_log = now + RXC_LOG_MS;
+		else if ((int64_t)(now - rx->dec_next_log) >= 0) {
+			uint32_t depth = jbuf_packets(rx->jbuf);
+
+			/* Bug B signature: RTP keeps being buffered (depth>0) but
+			 * the jitter buffer releases nothing for playout (ok=0).
+			 * This is a latched playout-anchor stall — every queued
+			 * frame's playout_time sits permanently in the future, so
+			 * jbuf_get() returns ENOENT forever, the receiver aubuf
+			 * underruns and downlink goes silent while rxc still climbs.
+			 * Recover by flushing the jitter buffer, which zeroes the
+			 * playout anchor (jb->p) so the next packet re-anchors the
+			 * timeline to wall-clock and playout resumes. Guarded so it
+			 * can only fire in the genuine stall, never on a healthy
+			 * call (ok>0 resets the counter). */
+			bool stalled = (rx->dec_ok == 0 && depth > 0);
+			if (stalled) {
+				if (++rx->dec_stall_ivs >= DEC_STALL_RECOVER_IVS) {
+					warning("rtprecv: DECODE %s playout STALL "
+						"(depth=%u, ok=0 for %us) — "
+						"flushing jbuf to re-anchor\n",
+						rx->name, depth,
+						rx->dec_stall_ivs);
+					jbuf_flush(rx->jbuf);
+					rx->dec_stall_ivs = 0;
+				}
+			}
+			else {
+				rx->dec_stall_ivs = 0;
+			}
+
+			info("rtprecv: DECODE %s ok=%llu eagain=%llu enoent=%llu"
+			     " total_ok=%llu jbuf_depth=%u next_play=%dms\n",
+			     rx->name,
+			     (unsigned long long)rx->dec_ok,
+			     (unsigned long long)rx->dec_eagain,
+			     (unsigned long long)rx->dec_enoent,
+			     (unsigned long long)rx->dec_ok_tot,
+			     depth, delay);
+			rx->dec_ok     = 0;
+			rx->dec_eagain = 0;
+			rx->dec_enoent = 0;
+			rx->dec_next_log = now + RXC_LOG_MS;
+		}
+	}
 
 	tmr_start(&rx->tmr_decode, delay, decode_tmr, rx);
 }
