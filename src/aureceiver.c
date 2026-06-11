@@ -71,6 +71,18 @@ struct audio_recv {
 	char *device;                 /**< Audio player device name          */
 	enum aufmt play_fmt;          /**< Sample format for audio playback  */
 	bool done_first;              /**< First auplay write done flag      */
+
+	/* Kallo SDK middle-link telemetry (Issue 1). The 0.1.7 trace had
+	 * "rtprecv: DECODE" (jbuf, upstream of the aubuf) and "aaudio: PLAYOUT"
+	 * (player, downstream of the aubuf) but nothing on the aubuf itself, so a
+	 * "DECODE ok>0 / PLAYOUT peak=0" stall could not be localised between the
+	 * two. Log, once per ~1s, frames pushed into the aubuf and its current
+	 * fill: decode reaching the aubuf (push>0, fill_ms>0) while PLAYOUT stays
+	 * silent means the player is bound to a different/stale buffer. */
+	uint64_t dbg_push;            /**< auframes pushed this interval     */
+	uint64_t dbg_push_tot;        /**< auframes pushed since alloc       */
+	uint64_t dbg_next_log;        /**< next telemetry log time [jiffies] */
+	uint32_t dbg_iv;              /**< interval index (≈ seconds)        */
 };
 
 
@@ -206,6 +218,33 @@ static int aurecv_push_aubuf(struct audio_recv *ar, const struct auframe *af)
 	if (bpms)
 		re_atomic_rlx_set(&ar->stats.latency,
 				  aubuf_cur_size(ar->aubuf) / bpms);
+
+	/* ── Kallo SDK aubuf middle-link telemetry (Issue 1) ────────────────────
+	 * One greppable "aureceiver: AUBUF" line per ~1s, sitting between
+	 * "rtprecv: DECODE" (jbuf) and "aaudio: PLAYOUT" (player). push>0 with
+	 * fill_ms>0 while PLAYOUT peak stays 0 localises a hold/resume downlink
+	 * stall to the aubuf↔player binding (the player is not draining THIS
+	 * buffer); push>0 with fill_ms≈0 and PLAYOUT silent points downstream. */
+	++ar->dbg_push;
+	++ar->dbg_push_tot;
+	{
+		const uint64_t now = tmr_jiffies();
+		if (!ar->dbg_next_log)
+			ar->dbg_next_log = now + 1000;
+		else if ((int64_t)(now - ar->dbg_next_log) >= 0) {
+			uint32_t fill_ms = bpms ?
+				(uint32_t)(aubuf_cur_size(ar->aubuf) / bpms) : 0;
+			info("aureceiver: AUBUF t=%us push=%llu fill_ms=%u "
+			     "total_push=%llu\n",
+			     ar->dbg_iv,
+			     (unsigned long long)ar->dbg_push,
+			     fill_ms,
+			     (unsigned long long)ar->dbg_push_tot);
+			ar->dbg_iv  += 1;
+			ar->dbg_push = 0;
+			ar->dbg_next_log = now + 1000;
+		}
+	}
 
 	return 0;
 }
@@ -451,6 +490,25 @@ void aurecv_flush(struct audio_recv *ar)
 	/* Reset audio filter chain */
 	list_flush(&ar->filtl);
 	mtx_unlock(ar->mtx);
+}
+
+
+/* Kallo SDK (Issue 1, hold/resume downlink): fully drop the receive aubuf so
+ * the next decoded frame reallocates a pristine buffer (fresh ajb anchor, zero
+ * residual fill/underrun state). aurecv_flush() only resets the existing
+ * buffer's anchor; on a hold→resume re-INVITE the buffer that lived through the
+ * hold could retain state that left the freshly reopened AAudio player reading
+ * silence forever (DECODE ok>0 but PLAYOUT peak=0). Dropping it guarantees the
+ * decoder→aubuf→new-player chain is rebound from scratch. Holds aubuf_mtx so
+ * the player's read handler (aurecv_read) never races the deref. */
+void aurecv_drop_aubuf(struct audio_recv *ar)
+{
+	if (!ar)
+		return;
+
+	mtx_lock(ar->aubuf_mtx);
+	ar->aubuf = mem_deref(ar->aubuf);
+	mtx_unlock(ar->aubuf_mtx);
 }
 
 

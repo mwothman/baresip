@@ -1291,6 +1291,26 @@ void audio_stop(struct audio *a)
 
 
 /**
+ * Reset the receive (downlink) audio chain
+ *
+ * Kallo SDK (Issue 1): drop the receiver's audio buffer so the next decoded
+ * frame reallocates a pristine one. Intended to be called between audio_stop()
+ * and audio_update() on a hold→resume re-INVITE, so the freshly reopened player
+ * is rebound to a fresh decode→aubuf chain rather than a buffer that lived
+ * through the hold (which could otherwise leave the new player reading silence).
+ *
+ * @param a Audio object
+ */
+void audio_rx_reset(struct audio *a)
+{
+	if (!a)
+		return;
+
+	aurecv_drop_aubuf(a->aur);
+}
+
+
+/**
  * Check if audio has been started
  *
  * @param a Audio object

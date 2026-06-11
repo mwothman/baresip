@@ -1459,6 +1459,7 @@ int  audio_update(struct audio *a);
 int  audio_start_source(struct audio *a, struct list *ausrcl,
 			struct list *aufiltl);
 void audio_stop(struct audio *a);
+void audio_rx_reset(struct audio *a);
 bool audio_started(const struct audio *a);
 int  audio_set_conference(struct audio *au, bool conference);
 bool audio_is_conference(const struct audio *au);

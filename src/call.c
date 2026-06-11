@@ -1825,7 +1825,28 @@ static int auth_handler(char **username, char **password,
 			const char *realm, void *arg)
 {
 	struct account *acc = arg;
-	return account_auth(acc, username, password, realm);
+	int err = account_auth(acc, username, password, realm);
+
+	/* Kallo SDK (Issue 2): make INVITE/in-dialog digest challenges visible.
+	 * The account auth handler IS wired to outgoing calls (sipsess_connect),
+	 * so a 401/407 on an INVITE is answered with the same credentials as
+	 * REGISTER. This logs each challenge it answers (realm + the auth
+	 * username actually used, never the password) so a "call drops on 407"
+	 * report can be confirmed against the wire: a line here means the SDK
+	 * supplied credentials; its absence means the challenge never reached the
+	 * account auth handler. */
+	if (err) {
+		warning("call: auth: no credentials for realm \"%s\" (%m)\n",
+			realm ? realm : "", err);
+	}
+	else {
+		info("call: auth: answering digest challenge realm=\"%s\" "
+		     "user=\"%s\"\n",
+		     realm ? realm : "",
+		     (username && *username) ? *username : "");
+	}
+
+	return err;
 }
 
 
