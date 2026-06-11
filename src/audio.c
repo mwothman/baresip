@@ -477,8 +477,18 @@ static void check_telev(struct audio *a, struct autx *tx)
 		tx->ts_tel = (uint32_t)tx->ts_ext;
 
 	fmt = sdp_media_rformat(stream_sdpmedia(audio_strm(a)), telev_rtpfmt);
-	if (!fmt)
+	if (!fmt) {
+		/* We had a DTMF (telephone-event) packet to send but the remote
+		 * never negotiated telephone-event in the SDP answer, so it cannot
+		 * be sent as RFC 2833 — it is silently lost (this is why a 3CX IVR
+		 * never reacts). Surface it instead of dropping quietly. */
+		warning("audio: telev: cannot send DTMF as RFC2833 — remote did"
+			" not negotiate telephone-event; check the SDP offer/answer\n");
 		goto out;
+	}
+
+	info("audio: telev: sending RFC2833 DTMF (pt=%u, marker=%d)\n",
+	     fmt->pt, marker);
 
 	mb->pos = STREAM_PRESZ;
 	mtx_lock(a->tx.mtx);

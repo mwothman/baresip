@@ -52,7 +52,24 @@ struct rtp_receiver {
 	int pt_tel;                    /**< Payload type for tel event       */
 	uint32_t srate;                /**< Receiver Samplerate              */
 	struct tmr tmr_decode;         /**< Decode Timer                     */
+
+	/* Kallo SDK inbound-RTP RX counter. Counts RTP packets/bytes actually
+	 * delivered to this receiver by the socket layer (rtprecv_decode), before
+	 * the jitter buffer and decoder. Purpose: on a silent call, distinguish
+	 * "no RTP arrives at all" (socket/bind/teardown residue — rxc_pkts stays 0)
+	 * from "RTP arrives but isn't decoded/played" (rxc_pkts climbs while the
+	 * aaudio PLAYOUT peak stays 0). Logged low-noise: one line per ~RXC_LOG_MS,
+	 * plus a first-packet line carrying SSRC and first sequence number. */
+	uint64_t rxc_pkts;             /**< RTP packets seen since RX start   */
+	uint64_t rxc_bytes;            /**< RTP payload bytes since RX start  */
+	uint64_t rxc_pkts_iv;          /**< packets this log interval         */
+	uint64_t rxc_bytes_iv;         /**< bytes this log interval           */
+	uint64_t rxc_next_log;         /**< jiffies of next periodic log      */
+	bool      rxc_first;           /**< first inbound packet logged       */
 };
+
+/* RX-counter log cadence [ms]. One greppable "rtprecv: RX" line per interval. */
+#define RXC_LOG_MS 1000
 
 
 enum work_type {
@@ -442,6 +459,40 @@ void rtprecv_decode(const struct sa *src, const struct rtp_header *hdr,
 	rx->ts_last = tmr_jiffies();
 
 	metric_add_packet(rx->metric, mbuf_get_left(mb));
+
+	/* ── Kallo SDK inbound-RTP RX counter ───────────────────────────────
+	 * Count what the socket layer actually delivered here, before jbuf/decode.
+	 * A silent call with rxc_pkts climbing => RTP arrives but is not decoded /
+	 * played (decoder/player/aaudio); rxc_pkts stuck at 0 => no RTP arrives at
+	 * all (bind/socket/teardown residue). Kept low-noise (~1 line/sec). */
+	{
+		const uint64_t now = rx->ts_last;
+		rx->rxc_pkts  += 1;
+		rx->rxc_bytes += mbuf_get_left(mb);
+		rx->rxc_pkts_iv  += 1;
+		rx->rxc_bytes_iv += mbuf_get_left(mb);
+
+		if (!rx->rxc_first) {
+			rx->rxc_first = true;
+			rx->rxc_next_log = now + RXC_LOG_MS;
+			info("rtprecv: RX first %s pkt ssrc=0x%08x seq=%u pt=%u"
+			     " from %J\n",
+			     rx->name, hdr->ssrc, hdr->seq, hdr->pt, src);
+		}
+		else if ((int64_t)(now - rx->rxc_next_log) >= 0) {
+			info("rtprecv: RX %s pkts=%llu bytes=%llu"
+			     " (+%llu pkts/+%llu bytes) ssrc=0x%08x\n",
+			     rx->name,
+			     (unsigned long long)rx->rxc_pkts,
+			     (unsigned long long)rx->rxc_bytes,
+			     (unsigned long long)rx->rxc_pkts_iv,
+			     (unsigned long long)rx->rxc_bytes_iv,
+			     hdr->ssrc);
+			rx->rxc_pkts_iv  = 0;
+			rx->rxc_bytes_iv = 0;
+			rx->rxc_next_log = now + RXC_LOG_MS;
+		}
+	}
 
 	if (!rx->rtp_estab) {
 		if (rx->rtpestabh) {

@@ -6,6 +6,7 @@
  */
 
 #include <re.h>
+#include <re_atomic.h>
 #include <rem.h>
 #include <baresip.h>
 
@@ -18,6 +19,16 @@ struct auplay_st {
 	void *arg;
 	struct auplay_prm play_prm;
 	size_t sampsz;
+
+	/* Kallo SDK: set true by the destructor before the stream is closed.
+	 * Closing an AAudio stream can itself fire errorCallback with state
+	 * DISCONNECTED, which would otherwise spawn restart_player_stream() and
+	 * reopen a fresh device stream on a detached thread just as this object
+	 * is being freed — leaking a live AAudio output stream that holds the
+	 * audio device into the next init() cycle (the "every other call has a
+	 * dead/silent downlink" idempotency bug). Both the error callback and the
+	 * restart thread bail out when this is set. */
+	RE_ATOMIC bool closing;
 
 	/* Kallo SDK playout instrumentation. Measures what actually reaches the
 	 * AAudio device at the pull point (dataCallback), so a silent downlink is
@@ -50,6 +61,8 @@ static void auplay_destructor(void *arg)
 	struct auplay_st *st = arg;
 
 	info("aaudio: player: closing stream\n");
+	/* Prevent a close-induced DISCONNECT from resurrecting the stream. */
+	re_atomic_rlx_set(&st->closing, true);
 	aaudio_close_stream(st->playerStream);
 
 	st->wh = NULL;
@@ -123,6 +136,10 @@ static void* restart_player_stream(void* data) {
 	aaudio_result_t result;
 	struct auplay_st *st = data;
 
+	/* Object is being torn down — do not reopen (would leak a stream). */
+	if (re_atomic_rlx(&st->closing))
+		return NULL;
+
 	AAudioStream_close(st->playerStream);
 
 	result = open_player_stream(st);
@@ -147,6 +164,10 @@ static void errorCallback(AAudioStream *stream, void *userData,
 	(void)error;
 	pthread_t thread_id;
 	int res;
+
+	/* Ignore disconnects once the object is being destroyed. */
+	if (re_atomic_rlx(&st->closing))
+		return;
 
 	aaudio_stream_state_t streamState = AAudioStream_getState(stream);
 	if (streamState == AAUDIO_STREAM_STATE_DISCONNECTED) {

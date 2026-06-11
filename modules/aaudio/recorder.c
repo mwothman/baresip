@@ -6,6 +6,7 @@
  */
 
 #include <re.h>
+#include <re_atomic.h>
 #include <rem.h>
 #include <baresip.h>
 #include <string.h>
@@ -23,6 +24,11 @@ struct ausrc_st {
 	size_t  sampsz;
 	size_t  sampc;
 	uint64_t samps;
+
+	/* Kallo SDK: see player.c. Set true by the destructor before closing the
+	 * stream so a close-induced DISCONNECT cannot spawn a detached restart
+	 * thread that reopens (and leaks) the input device into the next cycle. */
+	RE_ATOMIC bool closing;
 };
 
 
@@ -34,6 +40,8 @@ static void ausrc_destructor(void *arg)
 	struct ausrc_st *st = arg;
 
 	info("aaudio: recorder: closing stream\n");
+	/* Prevent a close-induced DISCONNECT from resurrecting the stream. */
+	re_atomic_rlx_set(&st->closing, true);
 	aaudio_close_stream(st->recorderStream);
 
 	mem_deref(st->sampv);
@@ -85,6 +93,10 @@ static void* restart_recorder_stream(void* data) {
 	aaudio_result_t result;
 	struct ausrc_st *st = data;
 
+	/* Object is being torn down — do not reopen (would leak a stream). */
+	if (re_atomic_rlx(&st->closing))
+		return NULL;
+
 	AAudioStream_close(st->recorderStream);
 
 	result = open_recorder_stream(st);
@@ -109,6 +121,10 @@ static void errorCallback(AAudioStream *stream, void *userData,
 	(void)error;
 	pthread_t thread_id;
 	int res;
+
+	/* Ignore disconnects once the object is being destroyed. */
+	if (re_atomic_rlx(&st->closing))
+		return;
 
 	aaudio_stream_state_t streamState = AAudioStream_getState(stream);
 	if (streamState == AAUDIO_STREAM_STATE_DISCONNECTED) {
