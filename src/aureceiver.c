@@ -83,7 +83,43 @@ struct audio_recv {
 	uint64_t dbg_push_tot;        /**< auframes pushed since alloc       */
 	uint64_t dbg_next_log;        /**< next telemetry log time [jiffies] */
 	uint32_t dbg_iv;              /**< interval index (≈ seconds)        */
+
+	/* Kallo SDK 0.1.10 — receive-aubuf IDENTITY proof + self-heal.
+	 *
+	 * The decisive 0.1.9 field report (3CX/PCMU/UDP) was: the AAudio data
+	 * callback keeps firing the whole call (PLAYOUT frames≈8004/s) yet outputs
+	 * pure silence (peak=0) while the receive buffer fills to and pins at the
+	 * 160 ms cap (AUBUF fill_ms=160) with DECODE/push fully healthy. A firing
+	 * player + a buffer nothing drains can only mean the side that DRAINS and
+	 * the side that FILLS are not looking at the same aubuf object — an
+	 * identity divergence, not a contents problem (0.1.7–0.1.9 reasoned about
+	 * contents and failed). The player binds `ar` (its arg) and reads
+	 * `ar->aubuf`; the RTP-receive path pushes into `ar->aubuf`. To settle it
+	 * in the field with zero ambiguity we log the ACTUAL pointers on BOTH
+	 * sides (player read vs rx push) so the next trace can confirm they match.
+	 *
+	 * play_frames / play_peak are updated by the player pull (auplay_write_
+	 * handler, an AAudio-thread context) and sampled by the rx push path to
+	 * drive the self-heal guard: if the player is firing but outputs silence
+	 * while the buffer is pinned at the cap for >~500 ms, request a player
+	 * re-bind to the current receive aubuf. The request is consumed at the top
+	 * of aurecv_receive (no ar->mtx held there) — never from inside the hot
+	 * path under the lock — so it cannot deadlock or fight the normal path. */
+	RE_ATOMIC uint64_t play_frames;  /**< frames the player has pulled       */
+	RE_ATOMIC int32_t  play_peak;    /**< peak |sample| since last guard eval */
+	RE_ATOMIC bool     heal_request; /**< deferred player-rebind request      */
+	uint64_t play_frames_last;    /**< push-side snapshot of play_frames  */
+	uint64_t heal_since;          /**< jiffies the stall was first seen   */
+	uint64_t dbg_rd_next_log;     /**< next player-read ptr log [jiffies] */
 };
+
+/* Sample magnitude (out of 32767) below which playout is treated as silence —
+ * matches aaudio/player.c. PCMU comfort noise / zero-fill underruns sit under
+ * it; speech / a test tone sits far above. */
+#define KALLO_SILENCE_THRESH 64
+
+/* Consecutive stall duration before the self-heal guard re-binds the player. */
+#define KALLO_HEAL_STALL_MS 500
 
 
 static void destructor(void *arg)
@@ -135,7 +171,8 @@ static double aurecv_calc_seconds(const struct audio_recv *ar)
 }
 
 
-static int aurecv_alloc_aubuf(struct audio_recv *ar, const struct auframe *af)
+static int aurecv_alloc_aubuf(struct audio_recv *ar, uint32_t srate,
+			      uint8_t ch)
 {
 	size_t min_sz;
 	size_t max_sz;
@@ -144,8 +181,8 @@ static int aurecv_alloc_aubuf(struct audio_recv *ar, const struct auframe *af)
 	int err;
 
 	sz = aufmt_sample_size(cfg->play_fmt);
-	min_sz = sz * au_calc_nsamp(af->srate, af->ch, cfg->buffer.min);
-	max_sz = sz * au_calc_nsamp(af->srate, af->ch, cfg->buffer.max);
+	min_sz = sz * au_calc_nsamp(srate, ch, cfg->buffer.min);
+	max_sz = sz * au_calc_nsamp(srate, ch, cfg->buffer.max);
 
 	debug("audio_recv: create audio buffer"
 	      " [%u - %u ms]"
@@ -187,7 +224,7 @@ static int aurecv_push_aubuf(struct audio_recv *ar, const struct auframe *af)
 	uint64_t bpms;
 
 	if (!ar->aubuf) {
-		err = aurecv_alloc_aubuf(ar, af);
+		err = aurecv_alloc_aubuf(ar, af->srate, af->ch);
 		if (err)
 			return err;
 	}
@@ -229,17 +266,62 @@ static int aurecv_push_aubuf(struct audio_recv *ar, const struct auframe *af)
 	++ar->dbg_push_tot;
 	{
 		const uint64_t now = tmr_jiffies();
+		uint32_t fill_ms = bpms ?
+			(uint32_t)(aubuf_cur_size(ar->aubuf) / bpms) : 0;
+
+		/* ── Kallo SDK 0.1.10 self-heal guard ───────────────────────────────
+		 * Evaluated every push (rx side, ≈50/s) — cheap, and exactly when the
+		 * buffer is being filled. If the player is FIRING (play_frames moving)
+		 * yet outputs only silence (peak<=thresh) while the buffer is pinned
+		 * near the cap, the draining side is not seeing what we fill — request
+		 * a player re-bind. We sample then zero play_peak so it reflects only
+		 * the ~20 ms since the previous push; a single non-silent window resets
+		 * the stall timer, so a healthy call (or normal speech gaps) never
+		 * trips it. The actual re-bind happens at the top of aurecv_receive,
+		 * where ar->mtx is NOT held (calling aurecv_start_player here would
+		 * re-lock ar->mtx and deadlock). Idempotent: the request is consumed
+		 * once; if still broken it re-arms KALLO_HEAL_STALL_MS later. */
+		const uint32_t cap_ms = ar->cfg->buffer.max;
+		uint64_t pf = re_atomic_rlx(&ar->play_frames);
+		int32_t  pk = re_atomic_rlx(&ar->play_peak);
+		re_atomic_rlx_set(&ar->play_peak, 0);
+		bool player_firing = (pf != ar->play_frames_last);
+		ar->play_frames_last = pf;
+		bool pinned = cap_ms && fill_ms >= (cap_ms * 7) / 8;
+		bool silent = pk <= KALLO_SILENCE_THRESH;
+
+		if (player_firing && pinned && silent) {
+			if (!ar->heal_since)
+				ar->heal_since = now;
+			else if ((int64_t)(now - ar->heal_since) >=
+				 KALLO_HEAL_STALL_MS) {
+				warning("aurecv: SELF-HEAL trigger ar=%p "
+					"aubuf=%p fill_ms=%u peak=%d — player "
+					"firing but draining silence; "
+					"requesting player re-bind\n",
+					(void *)ar, (void *)ar->aubuf,
+					fill_ms, pk);
+				re_atomic_rlx_set(&ar->heal_request, true);
+				ar->heal_since = 0;
+			}
+		}
+		else {
+			ar->heal_since = 0;
+		}
+
 		if (!ar->dbg_next_log)
 			ar->dbg_next_log = now + 1000;
 		else if ((int64_t)(now - ar->dbg_next_log) >= 0) {
-			uint32_t fill_ms = bpms ?
-				(uint32_t)(aubuf_cur_size(ar->aubuf) / bpms) : 0;
+			/* Greppable identity proof: the aubuf the rx fills.
+			 * Must equal the "player read" pointer logged from the
+			 * player pull side (auplay_write_handler). */
 			info("aureceiver: AUBUF t=%us push=%llu fill_ms=%u "
-			     "total_push=%llu\n",
+			     "total_push=%llu  rx push ar=%p aubuf=%p\n",
 			     ar->dbg_iv,
 			     (unsigned long long)ar->dbg_push,
 			     fill_ms,
-			     (unsigned long long)ar->dbg_push_tot);
+			     (unsigned long long)ar->dbg_push_tot,
+			     (void *)ar, (void *)ar->aubuf);
 			ar->dbg_iv  += 1;
 			ar->dbg_push = 0;
 			ar->dbg_next_log = now + 1000;
@@ -334,6 +416,20 @@ void aurecv_receive(struct audio_recv *ar, const struct rtp_header *hdr,
 
 	if (!mb)
 		return;
+
+	/* Kallo SDK 0.1.10 self-heal: consume a deferred player-rebind request
+	 * here — we are on the rx/decode thread and do NOT hold ar->mtx yet, so
+	 * aurecv_start_player() (which locks ar->mtx via aurecv_codec) is safe.
+	 * Re-binds the player to the CURRENT receive aubuf (single source of
+	 * truth); recovers both the startup race and a lost hold/resume rebind. */
+	if (re_atomic_rlx(&ar->heal_request)) {
+		re_atomic_rlx_set(&ar->heal_request, false);
+		aurecv_stop_auplay(ar);
+		(void)aurecv_start_player(ar, baresip_auplayl());
+		info("aurecv: SELF-HEAL re-bound player ar=%p aubuf=%p "
+		     "auplay=%p\n",
+		     (void *)ar, (void *)ar->aubuf, (void *)ar->auplay);
+	}
 
 	mtx_lock(ar->mtx);
 	if (hdr->pt != ar->pt) {
@@ -531,6 +627,10 @@ void aurecv_reset_aubuf(struct audio_recv *ar)
 	/* restart the middle-link telemetry for the new (post-resume) leg */
 	ar->dbg_push     = 0;
 	ar->dbg_next_log = 0;
+	/* reset the self-heal stall timer/snapshot so the new leg starts clean */
+	ar->heal_since        = 0;
+	ar->play_frames_last  = re_atomic_rlx(&ar->play_frames);
+	re_atomic_rlx_set(&ar->play_peak, 0);
 	mtx_unlock(ar->aubuf_mtx);
 
 	/* Re-anchor the receive timestamp / push-jitter state so the resumed
@@ -722,6 +822,43 @@ static void check_plframe(struct auframe *af1, struct auframe *af2)
  *
  * @note The sample format is set in ar->play_fmt
  */
+/* Kallo SDK 0.1.10: account what the player ACTUALLY pulled — drives the
+ * self-heal guard and the identity proof. Runs in the player (AAudio) thread
+ * context. Tracks liveness (play_frames) and peak |sample| over the window,
+ * and emits one greppable "player read ar=%p aubuf=%p" line per ~1 s. That
+ * pointer pair must equal the "rx push ar=%p aubuf=%p" line — if they ever
+ * diverge, the firing player and the filled buffer are different objects
+ * (the identity bug); if they match while downlink is silent, the fault is
+ * not the binding. ar->aubuf is read here without aubuf_mtx only for logging
+ * (a benign pointer read). */
+static void aurecv_account_playout(struct audio_recv *ar,
+				   const struct auframe *af)
+{
+	re_atomic_rlx_set(&ar->play_frames,
+			  re_atomic_rlx(&ar->play_frames) + af->sampc);
+
+	if (ar->play_fmt == AUFMT_S16LE && af->sampv) {
+		const int16_t *s = af->sampv;
+		int32_t pk = re_atomic_rlx(&ar->play_peak);
+		for (size_t i = 0; i < af->sampc; i++) {
+			int32_t v = s[i] < 0 ? -s[i] : s[i];
+			if (v > pk)
+				pk = v;
+		}
+		re_atomic_rlx_set(&ar->play_peak, pk);
+	}
+
+	const uint64_t now = tmr_jiffies();
+	if (!ar->dbg_rd_next_log)
+		ar->dbg_rd_next_log = now + 1000;
+	else if ((int64_t)(now - ar->dbg_rd_next_log) >= 0) {
+		info("aurecv: player read ar=%p aubuf=%p\n",
+		     (void *)ar, (void *)ar->aubuf);
+		ar->dbg_rd_next_log = now + 1000;
+	}
+}
+
+
 static void auplay_write_handler(struct auframe *af, void *arg)
 {
 	struct audio_recv *ar = arg;
@@ -735,10 +872,12 @@ static void auplay_write_handler(struct auframe *af, void *arg)
 
 		check_plframe(&afr, af);
 		ar->done_first = true;
+		aurecv_account_playout(ar, af);
 		return;
 	}
 
 	aurecv_read(ar, af);
+	aurecv_account_playout(ar, af);
 }
 
 
@@ -772,6 +911,28 @@ int aurecv_start_player(struct audio_recv *ar, struct list *auplayl)
 		prm.ptime      = ar->ptime / 1000;
 		prm.fmt        = ar->play_fmt;
 
+		/* Kallo SDK 0.1.10 — startup-race fix. The AAudio player starts
+		 * its data callback the instant auplay_alloc() returns (the
+		 * module calls AAudioStream_requestStart internally), and that
+		 * callback drains ar->aubuf. Previously ar->aubuf was created
+		 * lazily by the FIRST decoded frame, which arrives only after RX
+		 * is enabled — so the freshly opened player could fire against a
+		 * NULL buffer (silence branch) and recovery depended on a later
+		 * decode winning the realloc race under aubuf_mtx. On a fresh
+		 * call that race could lose from t=0 (2/3 calls silent in the
+		 * field). Pre-allocate the single, stable receive aubuf HERE,
+		 * before the player can fire, using the decoder's rate/channels —
+		 * the exact params the first push would use — so the player→aubuf
+		 * bind is to a real, live object from the very first callback.
+		 * Idempotent: a no-op if the buffer already exists (resume). */
+		if (!ar->aubuf) {
+			int aerr = aurecv_alloc_aubuf(ar, ac->srate, ac->ch);
+			if (aerr) {
+				warning("audio_recv: pre-alloc aubuf failed:"
+					" %m\n", aerr);
+			}
+		}
+
 		ar->auplay_prm = prm;
 		err = auplay_alloc(&ar->auplay, auplayl,
 				   ar->module,
@@ -786,8 +947,13 @@ int aurecv_start_player(struct audio_recv *ar, struct list *auplayl)
 
 		ar->ap = auplay_find(auplayl, ar->module);
 
+		/* Greppable identity proof at bind time: the player's write
+		 * handler captured `ar` as its arg and will read ar->aubuf. This
+		 * must be the SAME ar/aubuf the rx push path logs. */
 		info("audio_recv: player started with sample format %s\n",
 		     aufmt_name(ar->play_fmt));
+		info("aurecv: player bind ar=%p aubuf=%p auplay=%p\n",
+		     (void *)ar, (void *)ar->aubuf, (void *)ar->auplay);
 	}
 
 out:
