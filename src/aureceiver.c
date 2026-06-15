@@ -493,22 +493,54 @@ void aurecv_flush(struct audio_recv *ar)
 }
 
 
-/* Kallo SDK (Issue 1, hold/resume downlink): fully drop the receive aubuf so
- * the next decoded frame reallocates a pristine buffer (fresh ajb anchor, zero
- * residual fill/underrun state). aurecv_flush() only resets the existing
- * buffer's anchor; on a hold→resume re-INVITE the buffer that lived through the
- * hold could retain state that left the freshly reopened AAudio player reading
- * silence forever (DECODE ok>0 but PLAYOUT peak=0). Dropping it guarantees the
- * decoder→aubuf→new-player chain is rebound from scratch. Holds aubuf_mtx so
- * the player's read handler (aurecv_read) never races the deref. */
-void aurecv_drop_aubuf(struct audio_recv *ar)
+/* Kallo SDK (Issue 1, hold/resume downlink — DETERMINISTIC rebind, 0.1.9).
+ *
+ * Reset the receive (downlink) chain in place across a hold→resume re-INVITE,
+ * keeping a SINGLE STABLE aubuf object alive throughout the rebind.
+ *
+ * History: 0.1.6/0.1.7 reopened the player but reused the aubuf untouched
+ * (stale anchor → silence). 0.1.8 then *dropped* the aubuf (`ar->aubuf =
+ * mem_deref(...)` → NULL) so the next decoded frame would reallocate a pristine
+ * one. But that opened a window: audio_update() reopens the AAudio player
+ * (bound to `ar` via auplay_write_handler) while `ar->aubuf` is NULL, so the
+ * fresh player's pull callback reads the NULL/none branch (silence) and only
+ * "reconnects" once a later decoded frame happens to win the realloc race under
+ * aubuf_mtx. On resume that lazy realloc raced the just-reopened player and
+ * reconnected only intermittently — leaving the player reading silence for the
+ * rest of the call (DECODE ok≈50/s, AUBUF fill_ms pinned at the cap because the
+ * player never drained it, PLAYOUT peak=0).
+ *
+ * Fix: never let `ar->aubuf` go NULL across the rebind. The buffer object the
+ * receiver pushes into and the buffer object the reopened player reads from are
+ * THE SAME object, the whole time — so the decoder→aubuf→player consumer link
+ * is re-pointed deterministically with no NULL window and no realloc race. We
+ * only flush its contents and reset the playout/timestamp anchor so the new leg
+ * re-anchors to wall-clock (the pristine-buffer benefit 0.1.8 wanted, without
+ * the desync). Holds aubuf_mtx so the player's read handler (aurecv_read) never
+ * races the flush. If no buffer exists yet (resume before any frame decoded),
+ * leave it NULL — no player is draining it, and the next push allocates it.
+ */
+void aurecv_reset_aubuf(struct audio_recv *ar)
 {
 	if (!ar)
 		return;
 
 	mtx_lock(ar->aubuf_mtx);
-	ar->aubuf = mem_deref(ar->aubuf);
+	if (ar->aubuf)
+		aubuf_flush(ar->aubuf);   /* clear contents + reset adaptive anchor */
+	/* restart the middle-link telemetry for the new (post-resume) leg */
+	ar->dbg_push     = 0;
+	ar->dbg_next_log = 0;
 	mtx_unlock(ar->aubuf_mtx);
+
+	/* Re-anchor the receive timestamp / push-jitter state so the resumed
+	 * stream re-establishes its playout timeline against wall-clock rather
+	 * than carrying the pre-hold anchor forward. */
+	mtx_lock(ar->mtx);
+	ar->ts_recv.is_set   = false;
+	ar->ts_recv.num_wraps = 0;
+	ar->t = 0;
+	mtx_unlock(ar->mtx);
 }
 
 

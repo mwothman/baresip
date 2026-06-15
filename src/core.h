@@ -125,7 +125,7 @@ int  aurecv_decoder_set(struct audio_recv *ar,
 int  aurecv_payload_type(const struct audio_recv *ar);
 int  aurecv_filt_append(struct audio_recv *ar, struct aufilt_dec_st *decst);
 void aurecv_flush(struct audio_recv *ar);
-void aurecv_drop_aubuf(struct audio_recv *ar);
+void aurecv_reset_aubuf(struct audio_recv *ar);
 void aurecv_set_extmap(struct audio_recv *ar, uint8_t aulevel);
 int  aurecv_set_module(struct audio_recv *ar, const char *module);
 int  aurecv_set_device(struct audio_recv *ar, const char *device);
