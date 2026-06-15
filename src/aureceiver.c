@@ -111,6 +111,32 @@ struct audio_recv {
 	uint64_t play_frames_last;    /**< push-side snapshot of play_frames  */
 	uint64_t heal_since;          /**< jiffies the stall was first seen   */
 	uint64_t dbg_rd_next_log;     /**< next player-read ptr log [jiffies] */
+
+	/* Kallo SDK 0.1.11 — self-heal DEBOUNCE + read-point instrumentation.
+	 *
+	 * 0.1.10's guard fixed the buffer identity but introduced a thrash
+	 * regression: it judged a freshly opened AAudio player STALLED after only
+	 * KALLO_HEAL_STALL_MS (500 ms) — shorter than the time the player needs to
+	 * prime and report a real peak. So on every fresh call / resume the guard
+	 * tripped ~600 ms after the player opened, tore it down and reopened it,
+	 * tripped again on the next freshly opened (still priming) player, and
+	 * looped forever (~40 reopens in 37 s in the field). With the player never
+	 * allowed to run, it never drained the shared aubuf — fill stayed pinned at
+	 * the 160 ms cap with peak=0: the SAME end symptom as the identity bug, via
+	 * a different mechanism.
+	 *
+	 * Fix: (a) a grace window after ANY player open during which the guard must
+	 * NOT trigger (play_open_at + KALLO_HEAL_GRACE_MS), so a priming player is
+	 * never judged stalled; (b) a per-call retry cap (heal_attempts vs
+	 * KALLO_HEAL_MAX_ATTEMPTS) so the guard can never become a continuous
+	 * teardown loop — after N real stalls it logs and falls back; (c) the stall
+	 * timer (heal_since) must still persist KALLO_HEAL_STALL_MS *after* the grace
+	 * window before a rebind, and any healthy (non-silent / unpinned) window
+	 * resets both the timer and the retry budget. Result: at most a handful of
+	 * rebinds per genuinely stalled call, none while a player is priming. */
+	RE_ATOMIC uint64_t play_open_at; /**< jiffies of last player open        */
+	uint32_t heal_attempts;          /**< self-heal rebinds this call        */
+	uint64_t dbg_rdpt_next_log;      /**< next aubuf-read-point log [jiffies] */
 };
 
 /* Sample magnitude (out of 32767) below which playout is treated as silence —
@@ -120,6 +146,18 @@ struct audio_recv {
 
 /* Consecutive stall duration before the self-heal guard re-binds the player. */
 #define KALLO_HEAL_STALL_MS 500
+
+/* Kallo SDK 0.1.11 — grace window after any player open during which the
+ * self-heal guard must NOT trigger. A freshly opened AAudio low-latency stream
+ * needs time to prime and report a real peak (the field showed the first real
+ * playout ~600 ms after open); judging it stalled before that caused the
+ * 0.1.10 teardown loop. Must comfortably exceed the player prime time. */
+#define KALLO_HEAL_GRACE_MS 1500
+
+/* Max self-heal rebinds per call. Once exhausted the guard stops re-binding
+ * (logs a fallback) instead of looping — it can never become a continuous
+ * teardown loop. Reset on a healthy window and on a fresh leg (resume). */
+#define KALLO_HEAL_MAX_ATTEMPTS 3
 
 
 static void destructor(void *arg)
@@ -290,23 +328,50 @@ static int aurecv_push_aubuf(struct audio_recv *ar, const struct auframe *af)
 		bool pinned = cap_ms && fill_ms >= (cap_ms * 7) / 8;
 		bool silent = pk <= KALLO_SILENCE_THRESH;
 
-		if (player_firing && pinned && silent) {
+		/* Kallo SDK 0.1.11 — debounce. Don't judge a player that is still
+		 * priming: skip the whole eval while inside the grace window after
+		 * the last open. Outside the window, only a stall that persists
+		 * KALLO_HEAL_STALL_MS *and* a remaining retry budget triggers a
+		 * rebind; any healthy window clears the timer and refills the budget,
+		 * and an exhausted budget falls back (logs once) instead of looping. */
+		uint64_t opened = re_atomic_rlx(&ar->play_open_at);
+		bool in_grace = opened &&
+			(int64_t)(now - opened) < KALLO_HEAL_GRACE_MS;
+		bool stalling = player_firing && pinned && silent;
+
+		if (in_grace) {
+			/* priming — never trip, but don't reset the budget either */
+			ar->heal_since = 0;
+		}
+		else if (stalling && ar->heal_attempts < KALLO_HEAL_MAX_ATTEMPTS) {
 			if (!ar->heal_since)
 				ar->heal_since = now;
 			else if ((int64_t)(now - ar->heal_since) >=
 				 KALLO_HEAL_STALL_MS) {
+				++ar->heal_attempts;
 				warning("aurecv: SELF-HEAL trigger ar=%p "
-					"aubuf=%p fill_ms=%u peak=%d — player "
-					"firing but draining silence; "
+					"aubuf=%p fill_ms=%u peak=%d attempt=%u/%u"
+					" — player firing but draining silence; "
 					"requesting player re-bind\n",
 					(void *)ar, (void *)ar->aubuf,
-					fill_ms, pk);
+					fill_ms, pk, ar->heal_attempts,
+					(unsigned)KALLO_HEAL_MAX_ATTEMPTS);
 				re_atomic_rlx_set(&ar->heal_request, true);
 				ar->heal_since = 0;
 			}
 		}
-		else {
+		else if (stalling) {
+			/* budget exhausted (heal_attempts == MAX) — stop thrashing:
+			 * the safety net stays disarmed (the last "attempt=N/N"
+			 * trigger above is the marker) until a healthy window or a
+			 * fresh leg (resume) refills the budget. Never loops. */
 			ar->heal_since = 0;
+		}
+		else {
+			/* healthy / not pinned — recovered: clear timer and
+			 * refill the retry budget for the rest of the call */
+			ar->heal_since    = 0;
+			ar->heal_attempts = 0;
 		}
 
 		if (!ar->dbg_next_log)
@@ -627,8 +692,10 @@ void aurecv_reset_aubuf(struct audio_recv *ar)
 	/* restart the middle-link telemetry for the new (post-resume) leg */
 	ar->dbg_push     = 0;
 	ar->dbg_next_log = 0;
-	/* reset the self-heal stall timer/snapshot so the new leg starts clean */
+	/* reset the self-heal stall timer/snapshot so the new leg starts clean,
+	 * and refill the per-call retry budget for the resumed leg (0.1.11) */
 	ar->heal_since        = 0;
+	ar->heal_attempts     = 0;
 	ar->play_frames_last  = re_atomic_rlx(&ar->play_frames);
 	re_atomic_rlx_set(&ar->play_peak, 0);
 	mtx_unlock(ar->aubuf_mtx);
@@ -757,13 +824,63 @@ const struct aucodec *aurecv_codec(const struct audio_recv *ar)
 
 static void aurecv_read(struct audio_recv *ar, struct auframe *af)
 {
-	if (!ar || mtx_trylock(ar->aubuf_mtx) != thrd_success)
+	if (!ar)
 		return;
+
+	if (mtx_trylock(ar->aubuf_mtx) != thrd_success) {
+		/* Kallo SDK 0.1.11: never hand the device a stale/garbage frame
+		 * if we lose the trylock — emit silence and bail. (Prior code left
+		 * af->sampv untouched, relying on the caller's buffer being zero.) */
+		if (af && af->sampv)
+			memset(af->sampv, 0, auframe_size(af));
+		return;
+	}
+
+	/* ── Kallo SDK 0.1.11 read-point instrumentation ────────────────────────
+	 * Measure the PCM the player ACTUALLY dequeues, at the aubuf read point,
+	 * BEFORE it reaches AAudio — the 0.1.10 trace only had the peak at AAudio
+	 * playout, which could not tell apart (a) aubuf_read returns zeros / the
+	 * read pointer never advances, (b) it returns real samples but a convert
+	 * stage zeroes them, (c) it returns real samples but the player drops
+	 * them. We log, ~1×/s: the requested frame's srate/ch/fmt/sampc, the peak
+	 * |sample| just read, and aubuf cur_sz before vs after the read (proving
+	 * whether the read pointer advanced). Pair this with "aaudio: PLAYOUT
+	 * peak": read-peak>0 here but PLAYOUT peak=0 ⇒ the player drops it
+	 * downstream; read-peak=0 with cur_after≈cur_before ⇒ the read didn't
+	 * advance (dequeue / playout-start gate); read-peak=0 with the buffer
+	 * draining ⇒ the written region itself is silence (upstream). */
+	size_t cur_before = ar->aubuf ? aubuf_cur_size(ar->aubuf) : 0;
 
 	if (ar->aubuf)
 		aubuf_read_auframe(ar->aubuf, af);
-	else
+	else if (af && af->sampv)
 		memset(af->sampv, 0, auframe_size(af));
+
+	size_t cur_after = ar->aubuf ? aubuf_cur_size(ar->aubuf) : 0;
+
+	const uint64_t now = tmr_jiffies();
+	if (!ar->dbg_rdpt_next_log)
+		ar->dbg_rdpt_next_log = now + 1000;
+	else if ((int64_t)(now - ar->dbg_rdpt_next_log) >= 0) {
+		int32_t pk = 0;
+		if (af && af->fmt == AUFMT_S16LE && af->sampv) {
+			const int16_t *s = af->sampv;
+			for (size_t i = 0; i < af->sampc; i++) {
+				int32_t v = s[i] < 0 ? -s[i] : s[i];
+				if (v > pk)
+					pk = v;
+			}
+		}
+		info("aurecv: AUBUF-READ srate=%u ch=%u fmt=%s sampc=%zu "
+		     "peak=%d cur_before=%zu cur_after=%zu drained=%lld "
+		     "ar=%p aubuf=%p\n",
+		     af ? af->srate : 0, af ? af->ch : 0,
+		     af ? aufmt_name(af->fmt) : "?",
+		     af ? af->sampc : 0, pk, cur_before, cur_after,
+		     (long long)cur_before - (long long)cur_after,
+		     (void *)ar, (void *)ar->aubuf);
+		ar->dbg_rdpt_next_log = now + 1000;
+	}
 
 	mtx_unlock(ar->aubuf_mtx);
 }
@@ -954,6 +1071,17 @@ int aurecv_start_player(struct audio_recv *ar, struct list *auplayl)
 		     aufmt_name(ar->play_fmt));
 		info("aurecv: player bind ar=%p aubuf=%p auplay=%p\n",
 		     (void *)ar, (void *)ar->aubuf, (void *)ar->auplay);
+
+		/* Kallo SDK 0.1.11 — open the self-heal grace window. The guard
+		 * must not judge this freshly opened player until it has had
+		 * KALLO_HEAL_GRACE_MS to prime. Snapshot play_frames and clear the
+		 * stall timer so the new player starts from a clean liveness base.
+		 * (heal_attempts is deliberately NOT reset here — a self-heal
+		 * rebind opens a player too, and resetting would defeat the retry
+		 * cap; it is refilled only by a healthy window or a fresh leg.) */
+		re_atomic_rlx_set(&ar->play_open_at, tmr_jiffies());
+		ar->play_frames_last = re_atomic_rlx(&ar->play_frames);
+		ar->heal_since       = 0;
 	}
 
 out:
