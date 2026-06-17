@@ -235,15 +235,31 @@ static int aurecv_alloc_aubuf(struct audio_recv *ar, uint32_t srate,
 		goto out;
 	}
 
-	struct pl *id = pl_alloc_str("aureceiver");
-	if (!id) {
-		ar->aubuf = mem_deref(ar->aubuf);
-		err = ENOMEM;
-		goto out;
-	}
-
-	aubuf_set_id(ar->aubuf, id);
-	mem_deref(id);
+	/*
+	 * Kallo SDK 0.1.13 — DO NOT call aubuf_set_id() here.
+	 *
+	 * Root cause of the residual 3CX downlink silence: aubuf_set_id() is
+	 * defined ONLY in libre's aubuf TU (native/libre/rem/aubuf/aubuf.c),
+	 * whose `struct aubuf` carries two extra leading pointers (`pool`, `id`)
+	 * before `lock`, so its `id` field sits at byte offset 24. This buffer,
+	 * however, is allocated by librem's aubuf_alloc() (the copy that wins the
+	 * link order `rem` before `re` under --allow-multiple-definition), whose
+	 * `struct aubuf` has no such fields — offset 24 is `wish_sz`. The
+	 * cross-TU `ab->id = mem_ref(id)` therefore wrote the heap `id` pointer
+	 * straight into the librem buffer's `wish_sz` (observed on-device as
+	 * wish_sz≈1.3e19 = 0xB400…), and the read path re-armed fill_sz=wish_sz,
+	 * corrupting both gate thresholds. With mode=fixed the gate flips to
+	 * drain only once fill reaches wish_sz, but cur_sz caps at max_sz=2560
+	 * while wish_sz≈1.3e19 — unreachable, so the playout aubuf stayed in
+	 * `filling` forever and fed the player silence. The TX/mic aubuf never
+	 * calls aubuf_set_id(), which is exactly why it worked.
+	 *
+	 * The id was a diagnostic label only; it is NOT what guarantees the
+	 * 0.1.10 shared-buffer identity (that is the `ar->aubuf` pointer itself).
+	 * Dropping the call leaves wish_sz = min_sz (320 B = 20 ms @ 8 kHz mono
+	 * S16, ≤ max_sz), mirroring the working TX side. The GATE/AUBUF-READ
+	 * instrumentation is retained.
+	 */
 
 	aubuf_set_mode(ar->aubuf, cfg->adaptive ?
 		       AUBUF_ADAPTIVE : AUBUF_FIXED);
