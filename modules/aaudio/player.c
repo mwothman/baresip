@@ -210,7 +210,32 @@ static int open_player_stream(struct auplay_st *st) {
 	AAudioStreamBuilder_setDataCallback(builder, &dataCallback, st);
 	AAudioStreamBuilder_setErrorCallback(builder, &errorCallback, st);
 
+	/* Kallo SDK: pin the output to a concrete device when one was selected.
+	 * Without this the USAGE_VOICE_COMMUNICATION stream binds to the OS default
+	 * comm device, which auto-prefers a connected Bluetooth headset — so an
+	 * Earpiece/Speaker selection on the Kotlin side (setCommunicationDevice)
+	 * only flips the indicator while audio stays in the buds. The id is the
+	 * Android AudioDeviceInfo.getId(); 0 (AAUDIO_UNSPECIFIED) restores AAudio's
+	 * own routing. This also covers the restart_player_stream() disconnect→reopen
+	 * path (same function), so the pin survives a mid-call reconnect. */
+	int32_t want_id = aaudio_get_output_device_id();
+	if (want_id != AAUDIO_UNSPECIFIED)
+		AAudioStreamBuilder_setDeviceId(builder, want_id);
+
 	result = AAudioStreamBuilder_openStream(builder, &st->playerStream);
+	if (result != AAUDIO_OK && want_id != AAUDIO_UNSPECIFIED) {
+		/* The pinned device id was rejected — e.g. AudioDeviceInfo.getId() did
+		 * not map to a valid AAudio output device id on this OEM. Never hard-fail
+		 * the open: retry unspecified so the stream still opens. The Kotlin-side
+		 * setCommunicationDevice() stays in effect; the requested-vs-actual log
+		 * below makes the divergence obvious. */
+		warning("aaudio: player: openStream rejected deviceId=%d (%s); "
+			"retrying unspecified\n", want_id,
+			AAudio_convertResultToText(result));
+		AAudioStreamBuilder_setDeviceId(builder, AAUDIO_UNSPECIFIED);
+		want_id = AAUDIO_UNSPECIFIED;
+		result = AAudioStreamBuilder_openStream(builder, &st->playerStream);
+	}
 	if (result != AAUDIO_OK) {
 		warning("aaudio: player: failed to open stream: error %s\n",
 			AAudio_convertResultToText(result));
@@ -227,6 +252,13 @@ static int open_player_stream(struct auplay_st *st) {
 	     AAudioStream_getSessionId(st->playerStream),
 	     AAudioStream_getUsage(st->playerStream),
 	     AAudioStream_getPerformanceMode(st->playerStream));
+
+	/* Kallo SDK: verify the pin took. If requested != actual (and requested was
+	 * not unspecified), AudioDeviceInfo.getId() and the AAudio device id space
+	 * diverge on this device — audio may not land where selected even though the
+	 * open "succeeded". This is the line to check on the on-device route test. */
+	info("aaudio: player: deviceId pin requested=%d (0=unspecified) actual=%d\n",
+	     want_id, AAudioStream_getDeviceId(st->playerStream));
 
 	AAudioStreamBuilder_delete(builder);
 
