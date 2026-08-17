@@ -1057,9 +1057,24 @@ int aurecv_start_player(struct audio_recv *ar, struct list *auplayl)
 		 * before the player can fire, using the decoder's rate/channels —
 		 * the exact params the first push would use — so the player→aubuf
 		 * bind is to a real, live object from the very first callback.
-		 * Idempotent: a no-op if the buffer already exists (resume). */
+		 * Idempotent: a no-op if the buffer already exists (resume).
+		 *
+		 * Kallo SDK 0.1.19-dev — size it at srate_dsp/channels_dsp, NOT
+		 * ac->srate/ac->ch. Those are the same value unless
+		 * audio.srate_play decouples the device rate from the codec rate
+		 * (the Android Bluetooth quality investigation), and with an
+		 * override they differ by 6x: the frames that actually reach this
+		 * buffer are post-decode-filter, i.e. already resampled to
+		 * srate_play by auresamp (see aurecv_process_decfilt, which runs
+		 * before aurecv_push_aubuf). Sizing at the codec rate would leave
+		 * max_sz at 2560 B (160 ms @ 8 kHz) while each 20 ms frame is
+		 * 1920 B @ 48 kHz — barely one frame — so aubuf_write_auframe
+		 * would drop the oldest frame on nearly every push. Deriving both
+		 * from srate_dsp keeps the buffer's duration constant in ms and
+		 * leaves the no-override path byte-identical. */
 		if (!ar->aubuf) {
-			int aerr = aurecv_alloc_aubuf(ar, ac->srate, ac->ch);
+			int aerr = aurecv_alloc_aubuf(ar, srate_dsp,
+						      (uint8_t)channels_dsp);
 			if (aerr) {
 				warning("audio_recv: pre-alloc aubuf failed:"
 					" %m\n", aerr);

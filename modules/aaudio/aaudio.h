@@ -19,6 +19,16 @@ void aaudio_close_stream(AAudioStream *stream);
 void aaudio_set_output_device_id(int32_t id);
 int32_t aaudio_get_output_device_id(void);
 
+/* Kallo SDK (0.1.19-dev, Lever B): AAudio buffer sizing, in multiples of the
+ * stream's own framesPerBurst. Both streams have always been sized at burst*2,
+ * which is the low-latency minimum; over Bluetooth SCO the round trip is longer
+ * and jitterier than the built-in path, so that can underrun (audible as a rough
+ * or crackly downlink). This makes the multiplier settable at runtime so a
+ * larger cushion can be A/B'd against the current behaviour on one build.
+ * Default 2 == today's behaviour exactly. Applied on the next stream open. */
+void aaudio_set_buffer_bursts(int32_t bursts);
+int32_t aaudio_get_buffer_bursts(void);
+
 int aaudio_player_alloc(struct auplay_st **stp, const struct auplay *ap,
 			struct auplay_prm *prm, const char *device,
 			auplay_write_h *wh, void *arg);

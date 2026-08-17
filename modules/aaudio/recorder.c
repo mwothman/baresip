@@ -191,14 +191,28 @@ static int open_recorder_stream(struct ausrc_st *st) {
 
 	AAudioStreamBuilder_delete(builder);
 
-	AAudioStream_setBufferSizeInFrames(st->recorderStream,
-		AAudioStream_getFramesPerBurst(st->recorderStream) * 2);
+	/* Kallo SDK (Lever B): shared burst multiplier, default 2 == historical
+	 * behaviour. See aaudio.h. */
+	int32_t burst  = AAudioStream_getFramesPerBurst(st->recorderStream);
+	int32_t bursts = aaudio_get_buffer_bursts();
+	AAudioStream_setBufferSizeInFrames(st->recorderStream, burst * bursts);
 	int32_t bufferCapacity =
 		AAudioStream_getBufferCapacityInFrames(st->recorderStream);
 	int32_t bufferSize = AAudioStream_getBufferSizeInFrames(
 		st->recorderStream);
 	info("aaudio: recorder: buffer capacity: %d, buffer size: %d\n",
 	     bufferCapacity,  bufferSize);
+
+	/* Kallo SDK audio-quality instrumentation — uplink twin of the player's
+	 * STREAM-PARAMS line. Requested rate is the codec rate unless
+	 * audio.srate_src decouples it (Lever A). */
+	info("aaudio: STREAM-PARAMS recorder req_srate=%u act_srate=%d "
+	     "burst=%d bursts=%d bufsize=%d bufcap=%d perfmode=%d deviceId=%d\n",
+	     st->src_prm.srate,
+	     AAudioStream_getSampleRate(st->recorderStream),
+	     burst, bursts, bufferSize, bufferCapacity,
+	     AAudioStream_getPerformanceMode(st->recorderStream),
+	     AAudioStream_getDeviceId(st->recorderStream));
 
 	return AAUDIO_OK;
 }

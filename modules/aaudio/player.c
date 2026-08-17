@@ -45,6 +45,7 @@ struct auplay_st {
 	uint64_t dbg_silent_iv;  /**< count of fully-silent intervals    */
 	uint32_t dbg_iv;         /**< interval index (≈ seconds)         */
 	uint64_t dbg_win;        /**< frames remaining in current window */
+	int32_t  dbg_xruns_last; /**< last sampled cumulative XRun count  */
 };
 
 /* Sample magnitude below this (out of 32767) is treated as silence. PCMU
@@ -76,7 +77,6 @@ static void auplay_destructor(void *arg)
  */
  static int dataCallback(AAudioStream *stream, void *userData,
 			 void *audioData, int32_t numFrames) {
-	(void)stream;
 	struct auplay_st *st = userData;
 	struct auframe af;
 
@@ -108,14 +108,26 @@ static void auplay_destructor(void *arg)
 		if (silent)
 			++st->dbg_silent_iv;
 
+		/* Kallo SDK audio-quality instrumentation: sample the device's
+		 * own underrun counter on the same cadence. xruns is cumulative
+		 * since the stream opened, so d_xruns (the per-interval delta)
+		 * is the one to watch — a non-zero delta during the complaint
+		 * means the AAudio buffer is starving, which sounds ROUGH or
+		 * crackly. It staying 0 while audio still sounds bad points at
+		 * the signal path (rate conversion / narrowband) instead. */
+		int32_t xruns = AAudioStream_getXRunCount(stream);
+		int32_t d_xruns = xruns - st->dbg_xruns_last;
+		st->dbg_xruns_last = xruns;
+
 		/* One greppable line per second. "SILENT" marks a gap. */
 		info("aaudio: PLAYOUT t=%us frames=%llu peak=%d active=%u%% "
-		     "total=%llu silent_ivs=%llu%s\n",
+		     "total=%llu silent_ivs=%llu xruns=%d d_xruns=%d%s\n",
 		     st->dbg_iv,
 		     (unsigned long long)st->dbg_frames,
 		     (int)st->dbg_peak, act,
 		     (unsigned long long)st->dbg_total_fr,
 		     (unsigned long long)st->dbg_silent_iv,
+		     (int)xruns, (int)d_xruns,
 		     silent ? "  <<SILENT>>" : "");
 
 		st->dbg_iv     += 1;
@@ -262,8 +274,32 @@ static int open_player_stream(struct auplay_st *st) {
 
 	AAudioStreamBuilder_delete(builder);
 
-	AAudioStream_setBufferSizeInFrames(st->playerStream,
-		AAudioStream_getFramesPerBurst(st->playerStream) * 2);
+	/* Kallo SDK (Lever B): buffer size in framesPerBurst multiples. Default 2
+	 * is the historical value; a larger multiple trades playout latency for
+	 * underrun headroom on the Bluetooth SCO path. See aaudio.h. */
+	int32_t burst   = AAudioStream_getFramesPerBurst(st->playerStream);
+	int32_t bursts  = aaudio_get_buffer_bursts();
+	AAudioStream_setBufferSizeInFrames(st->playerStream, burst * bursts);
+
+	/* Fresh stream — its XRun counter restarts at 0, so re-base the delta
+	 * (this path also runs on the disconnect→reopen restart). */
+	st->dbg_xruns_last = 0;
+
+	/* ── Kallo SDK audio-quality instrumentation (STREAM-PARAMS) ─────────
+	 * One greppable line stating what we ASKED AAudio for versus what it
+	 * actually opened. The requested rate is the codec rate unless
+	 * audio.srate_play decouples it (Lever A), and a requested/actual
+	 * mismatch — or an 8000 Hz stream on a 48 kHz device — is the single
+	 * fact that decides whether the framework is resampling underneath us. */
+	info("aaudio: STREAM-PARAMS player req_srate=%u act_srate=%d "
+	     "burst=%d bursts=%d bufsize=%d bufcap=%d perfmode=%d deviceId=%d\n",
+	     st->play_prm.srate,
+	     AAudioStream_getSampleRate(st->playerStream),
+	     burst, bursts,
+	     AAudioStream_getBufferSizeInFrames(st->playerStream),
+	     AAudioStream_getBufferCapacityInFrames(st->playerStream),
+	     AAudioStream_getPerformanceMode(st->playerStream),
+	     AAudioStream_getDeviceId(st->playerStream));
 
 	return AAUDIO_OK;
 }
