@@ -1840,10 +1840,21 @@ static int auth_handler(char **username, char **password,
 			realm ? realm : "", err);
 	}
 	else {
+		/* Kallo: auth username masked (first 2 chars + length,
+		 * e.g. 10***(4)); never logged in plain text. */
+		const char *u = (username && *username) ? *username : "";
+		size_t ulen = strlen(u);
+		char masked[32];
+
+		if (ulen <= 2)
+			snprintf(masked, sizeof(masked), "***(%zu)", ulen);
+		else
+			snprintf(masked, sizeof(masked), "%.2s***(%zu)",
+				 u, ulen);
+
 		info("call: auth: answering digest challenge realm=\"%s\" "
 		     "user=\"%s\"\n",
-		     realm ? realm : "",
-		     (username && *username) ? *username : "");
+		     realm ? realm : "", masked);
 	}
 
 	return err;
