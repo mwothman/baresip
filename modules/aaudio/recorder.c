@@ -29,6 +29,24 @@ struct ausrc_st {
 	 * stream so a close-induced DISCONNECT cannot spawn a detached restart
 	 * thread that reopens (and leaks) the input device into the next cycle. */
 	RE_ATOMIC bool closing;
+
+	/* Kallo SDK (route-race fix): the disconnect->reopen restart runs on its
+	 * own thread. It used to be fire-and-forget: nothing joined it, nothing
+	 * stopped it racing the destructor (rebind / dispose / call end) over the
+	 * same AAudioStream pointer, and it kept using the object after it was
+	 * freed. Now: at most one restart thread per object; it is joinable and
+	 * the destructor joins it BEFORE touching the stream. rmtx only guards
+	 * the fields below and is never held across a blocking call. smtx serialises
+	 * "open + start the stream" in alloc against the restart thread's
+	 * close/open, so a disconnect that fires before alloc has finished cannot
+	 * pull the stream out from under it. */
+	mtx_t     rmtx;
+	mtx_t     smtx;             /**< open/start vs. restart exclusion   */
+	bool      rmtx_ok;
+	bool      restart_run;      /**< restart_tid valid, not yet joined  */
+	bool      restart_busy;     /**< a restart thread is running         */
+	bool      restart_again;    /**< disconnect seen while it was busy   */
+	pthread_t restart_tid;
 };
 
 
@@ -38,11 +56,42 @@ static int open_recorder_stream(struct ausrc_st *st);
 static void ausrc_destructor(void *arg)
 {
 	struct ausrc_st *st = arg;
+	pthread_t tid;
+	bool join = false;
 
 	info("aaudio: recorder: closing stream\n");
-	/* Prevent a close-induced DISCONNECT from resurrecting the stream. */
-	re_atomic_rlx_set(&st->closing, true);
+
+	memset(&tid, 0, sizeof(tid));
+
+	/* Prevent a close-induced DISCONNECT from resurrecting the stream, and
+	 * take ownership of the restart thread (if any) so nobody else joins
+	 * it. Once closing is set under rmtx no new restart thread can start. */
+	if (st->rmtx_ok) {
+		mtx_lock(&st->rmtx);
+		re_atomic_rlx_set(&st->closing, true);
+		join = st->restart_run;
+		tid  = st->restart_tid;
+		st->restart_run = false;
+		mtx_unlock(&st->rmtx);
+	}
+	else {
+		re_atomic_rlx_set(&st->closing, true);
+	}
+
+	/* Wait for an in-flight restart (close old / open new) to finish BEFORE
+	 * touching the stream: this is what makes close, open and restart
+	 * mutually exclusive. The restart thread takes no libre/baresip lock,
+	 * so waiting here (under the caller's re lock) cannot deadlock. */
+	if (join)
+		pthread_join(tid, NULL);
+
 	aaudio_close_stream(st->recorderStream);
+	st->recorderStream = NULL;
+
+	if (st->rmtx_ok) {
+		mtx_destroy(&st->smtx);
+		mtx_destroy(&st->rmtx);
+	}
 
 	mem_deref(st->sampv);
 	st->rh = NULL;
@@ -89,20 +138,29 @@ static void ausrc_destructor(void *arg)
 }
 
 
-static void* restart_recorder_stream(void* data) {
+static void do_restart_recorder(struct ausrc_st *st)
+{
 	aaudio_result_t result;
-	struct ausrc_st *st = data;
+	AAudioStream *old = st->recorderStream;
 
-	/* Object is being torn down — do not reopen (would leak a stream). */
+	/* Object is being torn down - do not touch the stream; the destructor
+	 * (which is waiting to join us) closes it. */
 	if (re_atomic_rlx(&st->closing))
-		return NULL;
+		return;
 
-	AAudioStream_close(st->recorderStream);
+	st->recorderStream = NULL;
+	if (old)
+		AAudioStream_close(old);
+
+	/* Torn down while we were closing: stay closed, nothing to reopen. */
+	if (re_atomic_rlx(&st->closing))
+		return;
 
 	result = open_recorder_stream(st);
 	if (result != AAUDIO_OK) {
-		warning("aaudio: recorder: failed to open stream\n");
-		return NULL;
+		warning("aaudio: failed to open recorder stream\n");
+		st->recorderStream = NULL;
+		return;
 	}
 
 	result = AAudioStream_requestStart(st->recorderStream);
@@ -110,8 +168,40 @@ static void* restart_recorder_stream(void* data) {
 		warning("aaudio: recorder: failed to start stream\n");
 	else
 		info("aaudio: recorder: stream started\n");
+}
 
-	pthread_exit(NULL);
+
+static void *restart_recorder_stream(void *data)
+{
+	struct ausrc_st *st = data;
+	int runs = 0;
+
+	for (;;) {
+		bool again;
+
+		mtx_lock(&st->smtx);
+		do_restart_recorder(st);
+		mtx_unlock(&st->smtx);
+
+		/* A disconnect that arrived while we were busy (the freshly
+		 * opened stream dropped again) is folded in here, bounded, so
+		 * it is neither lost nor turned into a second concurrent
+		 * thread. restart_busy is cleared under the same lock
+		 * errorCallback decides under, so exactly one of the two sees
+		 * the event. */
+		mtx_lock(&st->rmtx);
+		again = st->restart_again && !re_atomic_rlx(&st->closing) &&
+			++runs < 3;
+		st->restart_again = false;
+		if (!again)
+			st->restart_busy = false;
+		mtx_unlock(&st->rmtx);
+
+		if (!again)
+			break;
+	}
+
+	return NULL;
 }
 
 
@@ -119,7 +209,6 @@ static void errorCallback(AAudioStream *stream, void *userData,
 			  aaudio_result_t error) {
 	struct ausrc_st *st = userData;
 	(void)error;
-	pthread_t thread_id;
 	int res;
 
 	/* Ignore disconnects once the object is being destroyed. */
@@ -127,18 +216,47 @@ static void errorCallback(AAudioStream *stream, void *userData,
 		return;
 
 	aaudio_stream_state_t streamState = AAudioStream_getState(stream);
-	if (streamState == AAUDIO_STREAM_STATE_DISCONNECTED) {
-		info("aaudio: recorder: stream disconnected\n");
-		res = pthread_create(&thread_id, NULL,
-				     restart_recorder_stream, (void *)st);
-		if (res) {
-			warning("aaudio: recorder: error creating thread: "
-				"%d\n",	res);
-			return;
-		}
-		info("aaudio: recorder: created new thread (%u)\n",
-		     thread_id);
+	if (streamState != AAUDIO_STREAM_STATE_DISCONNECTED)
+		return;
+
+	info("aaudio: recorder: stream disconnected\n");
+
+	/* This runs on the stream's own callback thread, which
+	 * AAudioStream_close() joins - so it must never wait for anything the
+	 * closer holds. rmtx is only ever held for flag updates and for
+	 * reaping a thread that has already finished, never across a
+	 * close/open or a join of a live thread. */
+	mtx_lock(&st->rmtx);
+	if (re_atomic_rlx(&st->closing)) {
+		mtx_unlock(&st->rmtx);
+		return;
 	}
+
+	if (st->restart_busy) {
+		/* The running restart thread re-checks this before it exits. */
+		st->restart_again = true;
+		mtx_unlock(&st->rmtx);
+		return;
+	}
+
+	/* The previous restart thread has finished (restart_busy is cleared as
+	 * its last locked act): reap it so its resources are released. */
+	if (st->restart_run) {
+		pthread_join(st->restart_tid, NULL);
+		st->restart_run = false;
+	}
+
+	res = pthread_create(&st->restart_tid, NULL, restart_recorder_stream,
+			     (void *)st);
+	if (res) {
+		warning("aaudio: recorder: error creating thread: %d\n", res);
+	}
+	else {
+		st->restart_run  = true;
+		st->restart_busy = true;
+		info("aaudio: recorder: created restart thread\n");
+	}
+	mtx_unlock(&st->rmtx);
 }
 
 
@@ -174,6 +292,7 @@ static int open_recorder_stream(struct ausrc_st *st) {
 	if (result != AAUDIO_OK) {
 		warning("aaudio: recorder: failed to open stream: error %s\n",
 			AAudio_convertResultToText(result));
+		st->recorderStream = NULL;
 		return result;
 	}
 
@@ -224,6 +343,7 @@ int aaudio_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 {
 	struct ausrc_st *st;
 	aaudio_result_t result;
+	int32_t sid = 0;
 
 	if (!stp || !as || !prm || !rh)
 		return EINVAL;
@@ -247,6 +367,17 @@ int aaudio_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (!st)
 		return ENOMEM;
 
+	if (mtx_init(&st->rmtx, mtx_plain) != thrd_success) {
+		mem_deref(st);
+		return ENOMEM;
+	}
+	if (mtx_init(&st->smtx, mtx_plain) != thrd_success) {
+		mtx_destroy(&st->rmtx);
+		mem_deref(st);
+		return ENOMEM;
+	}
+	st->rmtx_ok = true;
+
 	st->src_prm = *prm;
 
 	st->sampsz = aufmt_sample_size(prm->fmt);
@@ -262,24 +393,27 @@ int aaudio_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	st->errh = errh;
 	st->arg = arg;
 
+	/* smtx: see player.c. */
+	mtx_lock(&st->smtx);
 	result = open_recorder_stream(st);
+	if (result == AAUDIO_OK) {
+		result = AAudioStream_requestStart(st->recorderStream);
+		if (result != AAUDIO_OK)
+			warning("aaudio: recorder: failed to start stream\n");
+		else
+			sid = AAudioStream_getSessionId(st->recorderStream);
+	}
+	mtx_unlock(&st->smtx);
 	if (result != AAUDIO_OK)
 		goto out;
 
-	result = AAudioStream_requestStart(st->recorderStream);
-	if (result != AAUDIO_OK) {
-		warning("aaudio: recorder: failed to start stream\n");
-		goto out;
-	}
-
-	module_event("aaudio", "recorder sessionid", NULL, NULL, "%d",
-		     AAudioStream_getSessionId(st->recorderStream));
+	module_event("aaudio", "recorder sessionid", NULL, NULL, "%d", sid);
 
 	info("aaudio: recorder: stream started\n");
 
   out:
 	if (result != AAUDIO_OK) {
-		aaudio_close_stream(st->recorderStream);
+		/* The destructor closes the stream (see player.c). */
 		mem_deref(st);
 	}
 	else
